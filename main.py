@@ -292,9 +292,12 @@ class GrokPlugin(Star):
 
         # 尺寸映射到比例
         size_map = {
-            "16:9": "1024x576", "9:16": "576x1024", "1:1": "1024x1024",
-            "2:3": "1024x1536", "3:2": "1536x1024"
-        }
+            "16:9": "1280x720", 
+            "9:16": "720x1280", 
+            "1:1": "1024x1024",
+            "2:3": "1024x1792",
+            "3:2": "1792x1024"
+        }                        
         if aspect_ratio and aspect_ratio in size_map:
             payload["size"] = size_map[aspect_ratio]
 
