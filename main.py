@@ -2,11 +2,13 @@ import asyncio
 import base64
 import io
 import json
+import mimetypes
 import time
 import re
 import uuid
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
+from urllib.parse import urlparse, unquote
 Image = None
 try:
     from PIL import Image
@@ -33,15 +35,11 @@ except ImportError:
 class GrokPlugin(Star):
     """Grok 多媒体与联网搜索插件 - 支持生图、生视频、联网搜索"""
 
-    ASPECT_RATIOS = {
-        "1:1": "1:1", "方": "1:1", "方形": "1:1",
-        "16:9": "16:9", "横": "16:9", "横屏": "16:9",
-        "9:16": "9:16", "竖": "9:16", "竖屏": "9:16",
-        "3:2": "3:2", "2:3": "2:3",
-    }
-
-    DEFAULT_ASPECT_RATIO = "9:16"
     DEFAULT_TEXT_IMAGE_SIZE = "1024x1792"
+    DEFAULT_VIDEO_SIZE = "1280x720"
+    DEFAULT_VIDEO_LENGTH_SECONDS = 6
+    SUPPORTED_VIDEO_LENGTH_SECONDS = (6, 10, 15)
+    VIDEO_RESOLUTION_NAME = "720p"
     SUPPORTED_IMAGE_SIZES = (
         "1024x1024",
         "1024x1792",
@@ -60,12 +58,19 @@ class GrokPlugin(Star):
     IMAGE_TIMEOUT = 120
     VIDEO_TIMEOUT = 300
     MAX_PROMPT_LENGTH = 4000
+    MAX_REQUEST_RETRIES = 3
+    RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+    MODEL_CACHE_TTL_SECONDS = 300
+    MODEL_PROBE_TIMEOUT = 15
+    IMAGE_RESPONSE_FORMAT_CANDIDATES = ("url", "b64_json", None)
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
+        self._models_cache: Dict[str, Any] = {"expires_at": 0.0, "models": set()}
+        self._models_cache_lock = asyncio.Lock()
         self.plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_grok_suite")
         self.temp_dir = Path(self.plugin_data_dir) / "temp"
         self.image_dir = Path(self.plugin_data_dir) / "images"
@@ -316,6 +321,116 @@ class GrokPlugin(Star):
         )
 
     @staticmethod
+    def _is_response_format_related_error(error_message: str) -> bool:
+        """判断是否是媒体格式参数相关错误"""
+        if not error_message:
+            return False
+        err = error_message.lower()
+        if "response_format" in err:
+            return True
+        return "format" in err and (
+            "invalid" in err
+            or "unsupported" in err
+            or "must be" in err
+        )
+
+    @classmethod
+    def _is_retryable_status(cls, status_code: int) -> bool:
+        """判断状态码是否适合自动重试"""
+        return status_code in cls.RETRYABLE_HTTP_STATUS_CODES
+
+    @staticmethod
+    def _retry_delay_seconds(attempt_index: int) -> float:
+        """退避重试等待时长"""
+        return min(1.5 * (2 ** attempt_index), 4.0)
+
+    @classmethod
+    def _parse_video_length_token(cls, token: str) -> Optional[int]:
+        """解析视频时长参数，支持 6/10/15 或 6s/10s/15s"""
+        if not token:
+            return None
+        cleaned = token.strip().lower()
+        if cleaned.endswith("s"):
+            cleaned = cleaned[:-1]
+        if not cleaned.isdigit():
+            return None
+        value = int(cleaned)
+        if value in cls.SUPPORTED_VIDEO_LENGTH_SECONDS:
+            return value
+        return None
+
+    @staticmethod
+    def _segment_type_name(seg: Any) -> str:
+        if not seg:
+            return ""
+        return seg.__class__.__name__.lower()
+
+    def _is_segment_type(self, seg: Any, type_name: str) -> bool:
+        """兼容不同平台实现的消息段类型判断"""
+        cls = getattr(Comp, type_name, None)
+        if cls is not None:
+            try:
+                if isinstance(seg, cls):
+                    return True
+            except Exception:
+                pass
+        return self._segment_type_name(seg) == type_name.lower()
+
+    @staticmethod
+    def _extract_segment_sources(seg: Any) -> List[str]:
+        sources: List[str] = []
+        for key in ("file", "url", "path", "src"):
+            value = getattr(seg, key, None)
+            if isinstance(value, str) and value.strip():
+                sources.append(value.strip())
+        return list(dict.fromkeys(sources))
+
+    @staticmethod
+    def _guess_filename_from_source(source: Optional[str], fallback: str) -> str:
+        if not source:
+            return fallback
+        try:
+            if source.startswith("http"):
+                parsed = urlparse(source)
+                candidate = unquote(Path(parsed.path).name)
+            else:
+                candidate = Path(source).name
+            if candidate:
+                return candidate
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def _guess_mime_type_from_source(source: Optional[str], default: str) -> str:
+        if source:
+            guess, _ = mimetypes.guess_type(source)
+            if guess:
+                return guess
+        return default
+
+    @classmethod
+    def _guess_audio_format_from_source(cls, source: Optional[str]) -> str:
+        if not source:
+            return "mp3"
+        name = source.split("?", 1)[0].lower()
+        if name.endswith(".wav"):
+            return "wav"
+        if name.endswith(".flac"):
+            return "flac"
+        if name.endswith(".ogg"):
+            return "ogg"
+        if name.endswith(".m4a"):
+            return "m4a"
+        if name.endswith(".aac"):
+            return "aac"
+        if name.endswith(".opus"):
+            return "opus"
+        if name.endswith(".mp3"):
+            return "mp3"
+        return "mp3"
+
+    @staticmethod
     def _parse_size_string(size: str) -> Optional[Tuple[int, int]]:
         """解析 WxH 字符串"""
         if not size or "x" not in size.lower():
@@ -335,6 +450,16 @@ class GrokPlugin(Star):
         """格式化尺寸字符串"""
         return f"{width}x{height}"
 
+    def _normalize_supported_size(self, size: str) -> Optional[str]:
+        """归一化并校验是否为受支持尺寸"""
+        parsed = self._parse_size_string(size)
+        if not parsed:
+            return None
+        normalized = self._format_size(parsed[0], parsed[1])
+        if normalized in self.SUPPORTED_IMAGE_SIZES:
+            return normalized
+        return None
+
     def _get_image_resolution(self, image_bytes: bytes) -> Optional[Tuple[int, int]]:
         """读取图片分辨率"""
         if not Image:
@@ -348,45 +473,6 @@ class GrokPlugin(Star):
         except Exception as e:
             logger.warning(f"读取图片分辨率失败: {e}")
             return None
-
-    @staticmethod
-    def _ratio_value(aspect_ratio: str) -> Optional[float]:
-        """将比例字符串转换为浮点值"""
-        if not aspect_ratio or ":" not in aspect_ratio:
-            return None
-        try:
-            w_str, h_str = aspect_ratio.split(":", 1)
-            width = float(w_str.strip())
-            height = float(h_str.strip())
-            if width <= 0 or height <= 0:
-                return None
-            return width / height
-        except (ValueError, AttributeError):
-            return None
-
-    def _get_aspect_ratio_from_dimensions(self, width: int, height: int) -> Optional[str]:
-        """从宽高比匹配最接近的支持比例"""
-        if width <= 0 or height <= 0:
-            return None
-
-        ratio = width / height
-        supported_ratios = {
-            "16:9": 16 / 9,
-            "3:2": 3 / 2,
-            "1:1": 1.0,
-            "2:3": 2 / 3,
-            "9:16": 9 / 16,
-        }
-        closest = min(supported_ratios.items(), key=lambda x: abs(x[1] - ratio))
-        return closest[0]
-
-    def _get_aspect_ratio_from_size(self, size: str) -> Optional[str]:
-        """从尺寸字符串推导最接近的比例"""
-        parsed = self._parse_size_string(size)
-        if not parsed:
-            return None
-        width, height = parsed
-        return self._get_aspect_ratio_from_dimensions(width, height)
 
     def _get_closest_supported_size(self, width: int, height: int) -> Optional[str]:
         """按分辨率距离匹配最接近的合法尺寸"""
@@ -418,44 +504,90 @@ class GrokPlugin(Star):
         best = min(candidates, key=distance)
         return best[0]
 
-    def _get_size_for_aspect_ratio(self, aspect_ratio: str, prefer_high_resolution: bool = True) -> Optional[str]:
-        """按比例匹配合法尺寸，可优先选择更高分辨率"""
-        target_ratio = self._ratio_value(aspect_ratio)
-        if target_ratio is None:
-            return self.DEFAULT_TEXT_IMAGE_SIZE
+    def _build_video_prompt(self, prompt: str, has_reference_image: bool) -> str:
+        """构建视频增强提示词，默认开启细节与稳定性增强"""
+        enhancement_hint = (
+            "画面要求：高细节、清晰边缘、低噪点、运动稳定、时序一致。"
+            "输出风格自然，不要过度锐化。"
+        )
+        if has_reference_image:
+            consistency_hint = "保持参考图主体身份、构图和色调风格一致。"
+        else:
+            consistency_hint = "主体动作连贯，镜头转场平滑。"
+        return f"{prompt}\n\n{enhancement_hint}{consistency_hint}"
 
-        candidates: List[Tuple[str, float, int]] = []
-        for size_str in self.SUPPORTED_IMAGE_SIZES:
-            parsed = self._parse_size_string(size_str)
-            if not parsed:
-                continue
-            width, height = parsed
-            ratio_distance = abs((width / height) - target_ratio)
-            area = width * height
-            candidates.append((size_str, ratio_distance, area))
+    async def _fetch_available_models(self) -> Optional[set]:
+        """探测当前可用模型列表，带短时缓存"""
+        now = time.time()
+        async with self._models_cache_lock:
+            cached_models = set(self._models_cache.get("models", set()))
+            expires_at = float(self._models_cache.get("expires_at", 0.0))
+            if cached_models and now < expires_at:
+                return cached_models
 
-        if not candidates:
+        base_url = self._get_base_url()
+        api_url = f"{base_url}/v1/models"
+        try:
+            session = await self._ensure_session()
+            api_key = str(self.conf.get("grok_api_key", "")).strip()
+            async with session.get(
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(total=self.MODEL_PROBE_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                raw_text = await resp.text()
+            data = json.loads(raw_text)
+            model_ids: set = set()
+            for item in data.get("data", []) if isinstance(data, dict) else []:
+                if isinstance(item, dict):
+                    model_id = str(item.get("id", "")).strip()
+                    if model_id:
+                        model_ids.add(model_id)
+            if not model_ids:
+                return None
+            async with self._models_cache_lock:
+                self._models_cache["models"] = model_ids
+                self._models_cache["expires_at"] = time.time() + self.MODEL_CACHE_TTL_SECONDS
+            return set(model_ids)
+        except Exception:
             return None
 
-        candidates.sort(key=lambda x: x[1])
-        if not prefer_high_resolution:
-            best_ratio_distance = candidates[0][1]
-            best_candidates = [c for c in candidates if abs(c[1] - best_ratio_distance) < 1e-9]
-            return max(best_candidates, key=lambda x: x[2])[0]
+    async def _resolve_model(
+        self,
+        configured_model: str,
+        fallback_models: List[str],
+        scene: str,
+    ) -> str:
+        """根据 /v1/models 自动选择可用模型，不可用时按候选回退"""
+        preferred_model = str(configured_model or "").strip()
+        if not preferred_model and fallback_models:
+            preferred_model = fallback_models[0]
 
-        best_ratio_distance = candidates[0][1]
-        ratio_window = best_ratio_distance + 0.03
-        high_res_candidates = [c for c in candidates if c[1] <= ratio_window]
-        return max(high_res_candidates, key=lambda x: x[2])[0]
+        candidates: List[str] = []
+        for model_name in [preferred_model, *fallback_models]:
+            model_name = str(model_name or "").strip()
+            if model_name and model_name not in candidates:
+                candidates.append(model_name)
 
-    def _get_video_resolution_name(self, size: Optional[str]) -> str:
-        """根据目标尺寸推导视频分辨率档位"""
-        parsed = self._parse_size_string(size or "")
-        if parsed:
-            width, height = parsed
-            if max(width, height) >= 1700:
-                return "1080p"
-        return "720p"
+        if not candidates:
+            return preferred_model
+
+        available_models = await self._fetch_available_models()
+        if not available_models:
+            return candidates[0]
+
+        for candidate in candidates:
+            if candidate in available_models:
+                if candidate != candidates[0]:
+                    logger.warning(
+                        f"[{scene}] 配置模型不可用，自动回退为可用模型: {candidate}"
+                    )
+                return candidate
+
+        logger.warning(f"[{scene}] 未命中可用候选模型，继续使用: {candidates[0]}")
+        return candidates[0]
 
     # ==================== API 调用 ====================
 
@@ -503,8 +635,8 @@ class GrokPlugin(Star):
         self,
         prompt: str,
         image_bytes: Optional[bytes] = None,
+        mask_bytes: Optional[bytes] = None,
         n: int = 1,
-        aspect_ratio: str = "1:1",
         target_size: Optional[str] = None,
     ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 生图 API，返回 [(url_or_path, bytes), ...] 或错误
@@ -513,57 +645,99 @@ class GrokPlugin(Star):
         图生图: POST /v1/images/edits (multipart/form-data)
         """
         if image_bytes:
-            return await self._edit_image(prompt, image_bytes, n, aspect_ratio, target_size=target_size)
+            return await self._edit_image(
+                prompt,
+                image_bytes,
+                n,
+                target_size=target_size,
+                mask_bytes=mask_bytes,
+            )
 
         base_url = self._get_base_url()
         api_url = f"{base_url}/v1/images/generations"
-        model = self.conf.get("grok_image_model", "grok-imagine-1.0")
-
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "n": max(1, min(n, self.MAX_IMAGE_COUNT)),
-            "response_format": "url"
-        }
-
-        resolved_size = target_size or self._get_size_for_aspect_ratio(
-            aspect_ratio,
-            prefer_high_resolution=True,
+        configured_model = self.conf.get("grok_image_model", "grok-imagine-1.0")
+        model = await self._resolve_model(
+            configured_model=configured_model,
+            fallback_models=["grok-imagine-1.0"],
+            scene="文生图",
         )
-        if resolved_size:
-            payload["size"] = resolved_size
 
-        try:
-            session = await self._ensure_session()
-            async with session.post(
-                api_url,
-                headers=self._get_headers(),
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT)
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"[文生图] API 请求失败 (状态码: {resp.status}): {text[:200]}")
-                    detail = self._extract_api_error_message(text)
-                    return [], self._translate_error(detail or f"状态码: {resp.status}")
+        resolved_size = target_size or self.DEFAULT_TEXT_IMAGE_SIZE
+        last_error: Optional[str] = None
 
-                raw_content = await resp.read()
+        for response_format in self.IMAGE_RESPONSE_FORMAT_CANDIDATES:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "n": max(1, min(n, self.MAX_IMAGE_COUNT)),
+            }
+            if response_format:
+                payload["response_format"] = response_format
+            if resolved_size:
+                payload["size"] = resolved_size
+
+            for attempt in range(self.MAX_REQUEST_RETRIES):
                 try:
-                    data = json.loads(raw_content.decode('utf-8'))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
-                    return [], "API响应格式异常"
+                    session = await self._ensure_session()
+                    async with session.post(
+                        api_url,
+                        headers=self._get_headers(),
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            logger.error(
+                                f"[文生图] API 请求失败 (状态码: {resp.status}): {text[:200]}"
+                            )
+                            detail = self._extract_api_error_message(text)
+                            translated_error = self._translate_error(
+                                detail or f"状态码: {resp.status}"
+                            )
+                            last_error = translated_error
 
-                results = self._parse_image_api_response(data)
-                if results:
-                    return results, None
-                return [], "未能从响应中提取图片"
+                            if (
+                                response_format
+                                and self._is_response_format_related_error(detail)
+                            ):
+                                logger.warning(
+                                    f"[文生图] 返回格式不兼容，自动切换模式重试: {detail[:120]}"
+                                )
+                                break
 
-        except asyncio.TimeoutError:
-            return [], "请求超时，请重试"
-        except Exception as e:
-            logger.error(f"[文生图] 请求异常: {e}")
-            return [], self._translate_error(str(e))
+                            if (
+                                self._is_retryable_status(resp.status)
+                                and attempt < self.MAX_REQUEST_RETRIES - 1
+                            ):
+                                await asyncio.sleep(self._retry_delay_seconds(attempt))
+                                continue
+                            return [], translated_error
+
+                        raw_content = await resp.read()
+                        try:
+                            data = json.loads(raw_content.decode("utf-8"))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
+                            return [], "API响应格式异常"
+
+                        results = self._parse_image_api_response(data)
+                        if results:
+                            return results, None
+                        return [], "未能从响应中提取图片"
+
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    if attempt < self.MAX_REQUEST_RETRIES - 1:
+                        await asyncio.sleep(self._retry_delay_seconds(attempt))
+                        continue
+                    last_error = "请求超时，请重试"
+                except Exception as e:
+                    if attempt < self.MAX_REQUEST_RETRIES - 1:
+                        await asyncio.sleep(self._retry_delay_seconds(attempt))
+                        continue
+                    logger.error(f"[文生图] 请求异常: {e}")
+                    last_error = self._translate_error(str(e))
+
+        return [], last_error or "文生图请求失败"
 
     def _build_edit_image_form(
         self,
@@ -572,13 +746,16 @@ class GrokPlugin(Star):
         n: int,
         image_bytes: bytes,
         size: Optional[str] = None,
+        response_format: Optional[str] = "url",
+        mask_bytes: Optional[bytes] = None,
     ) -> aiohttp.FormData:
         """构建图生图请求体"""
         form = aiohttp.FormData()
         form.add_field("model", model)
         form.add_field("prompt", prompt)
         form.add_field("n", str(max(1, min(n, self.MAX_IMAGE_COUNT))))
-        form.add_field("response_format", "url")
+        if response_format:
+            form.add_field("response_format", response_format)
         if size:
             form.add_field("size", size)
 
@@ -592,6 +769,17 @@ class GrokPlugin(Star):
             filename=f"image.{ext}",
             content_type=mime_type,
         )
+        if mask_bytes:
+            mask_mime_type = self._detect_mime_type(mask_bytes)
+            mask_ext = mask_mime_type.split("/")[-1]
+            if mask_ext == "jpeg":
+                mask_ext = "jpg"
+            form.add_field(
+                "mask",
+                mask_bytes,
+                filename=f"mask.{mask_ext}",
+                content_type=mask_mime_type,
+            )
         return form
 
     async def _edit_image(
@@ -599,8 +787,8 @@ class GrokPlugin(Star):
         prompt: str,
         image_bytes: bytes,
         n: int = 1,
-        aspect_ratio: str = "1:1",
         target_size: Optional[str] = None,
+        mask_bytes: Optional[bytes] = None,
     ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 图片编辑 API (图生图)
 
@@ -608,71 +796,124 @@ class GrokPlugin(Star):
         """
         base_url = self._get_base_url()
         api_url = f"{base_url}/v1/images/edits"
-        model = self.conf.get("grok_edit_model", "grok-imagine-1.0-edit")
+        configured_model = self.conf.get("grok_edit_model", "grok-imagine-1.0-edit")
+        model = await self._resolve_model(
+            configured_model=configured_model,
+            fallback_models=["grok-imagine-1.0-edit", "grok-imagine-1.0"],
+            scene="图生图",
+        )
         resolved_size = target_size
         if not resolved_size:
             source_resolution = self._get_image_resolution(image_bytes)
             if source_resolution:
                 resolved_size = self._get_closest_supported_size(*source_resolution)
             if not resolved_size:
-                resolved_size = self._get_size_for_aspect_ratio(aspect_ratio, prefer_high_resolution=True)
+                resolved_size = self.DEFAULT_TEXT_IMAGE_SIZE
 
         size_attempts: List[Optional[str]] = [resolved_size] if resolved_size else [None]
         if resolved_size:
             size_attempts.append(None)
 
-        last_error = None
+        last_error: Optional[str] = None
         for current_size in size_attempts:
-            form = self._build_edit_image_form(model, prompt, n, image_bytes, size=current_size)
-            try:
-                session = await self._ensure_session()
-                headers = {"Authorization": f"Bearer {self.conf.get('grok_api_key', '')}"}
-                async with session.post(
-                    api_url,
-                    headers=headers,
-                    data=form,
-                    timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT)
-                ) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        logger.error(f"[图生图] API 请求失败 (状态码: {resp.status}): {text[:200]}")
-                        detail = self._extract_api_error_message(text)
-                        translated_error = self._translate_error(detail or f"状态码: {resp.status}")
-                        last_error = translated_error
-
-                        if current_size and self._is_size_related_error(detail):
-                            logger.warning(
-                                f"[图生图] size={current_size} 失败，尝试降级为后端默认尺寸: {detail[:120]}"
-                            )
-                            continue
-                        return [], translated_error
-
-                    raw_content = await resp.read()
+            fallback_next_size = False
+            for response_format in self.IMAGE_RESPONSE_FORMAT_CANDIDATES:
+                format_changed = False
+                for attempt in range(self.MAX_REQUEST_RETRIES):
+                    form = self._build_edit_image_form(
+                        model=model,
+                        prompt=prompt,
+                        n=n,
+                        image_bytes=image_bytes,
+                        size=current_size,
+                        response_format=response_format,
+                        mask_bytes=mask_bytes,
+                    )
                     try:
-                        data = json.loads(raw_content.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
-                        return [], "API响应格式异常"
+                        session = await self._ensure_session()
+                        headers = {"Authorization": f"Bearer {self.conf.get('grok_api_key', '')}"}
+                        async with session.post(
+                            api_url,
+                            headers=headers,
+                            data=form,
+                            timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT),
+                        ) as resp:
+                            if resp.status != 200:
+                                text = await resp.text()
+                                logger.error(
+                                    f"[图生图] API 请求失败 (状态码: {resp.status}): {text[:200]}"
+                                )
+                                detail = self._extract_api_error_message(text)
+                                translated_error = self._translate_error(
+                                    detail or f"状态码: {resp.status}"
+                                )
+                                last_error = translated_error
 
-                    results = self._parse_image_api_response(data)
-                    if results:
-                        return results, None
-                    return [], "未能从响应中提取图片"
+                                if current_size and self._is_size_related_error(detail):
+                                    logger.warning(
+                                        f"[图生图] size={current_size} 失败，尝试降级为后端默认尺寸: {detail[:120]}"
+                                    )
+                                    fallback_next_size = True
+                                    break
 
-            except asyncio.TimeoutError:
-                return [], "请求超时，请重试"
-            except Exception as e:
-                logger.error(f"[图生图] 请求异常: {e}")
-                return [], self._translate_error(str(e))
+                                if (
+                                    response_format
+                                    and self._is_response_format_related_error(detail)
+                                ):
+                                    logger.warning(
+                                        f"[图生图] 返回格式不兼容，自动切换模式重试: {detail[:120]}"
+                                    )
+                                    format_changed = True
+                                    break
+
+                                if (
+                                    self._is_retryable_status(resp.status)
+                                    and attempt < self.MAX_REQUEST_RETRIES - 1
+                                ):
+                                    await asyncio.sleep(self._retry_delay_seconds(attempt))
+                                    continue
+                                return [], translated_error
+
+                            raw_content = await resp.read()
+                            try:
+                                data = json.loads(raw_content.decode("utf-8"))
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
+                                return [], "API响应格式异常"
+
+                            results = self._parse_image_api_response(data)
+                            if results:
+                                return results, None
+                            return [], "未能从响应中提取图片"
+
+                    except (asyncio.TimeoutError, aiohttp.ClientError):
+                        if attempt < self.MAX_REQUEST_RETRIES - 1:
+                            await asyncio.sleep(self._retry_delay_seconds(attempt))
+                            continue
+                        last_error = "请求超时，请重试"
+                    except Exception as e:
+                        if attempt < self.MAX_REQUEST_RETRIES - 1:
+                            await asyncio.sleep(self._retry_delay_seconds(attempt))
+                            continue
+                        logger.error(f"[图生图] 请求异常: {e}")
+                        last_error = self._translate_error(str(e))
+
+                if fallback_next_size:
+                    break
+                if format_changed:
+                    continue
+
+            if fallback_next_size:
+                continue
 
         return [], last_error or "图生图请求失败"
 
     async def _generate_video(
         self,
         prompt: str,
-        image_bytes: bytes,
-        aspect_ratio: str = "16:9",
-        resolution_name: str = "720p",
+        image_bytes: Optional[bytes] = None,
+        target_size: str = "1280x720",
+        video_length: int = 6,
     ) -> Tuple[Optional[str], Optional[str]]:
         """调用 Grok 生视频 API
 
@@ -680,36 +921,52 @@ class GrokPlugin(Star):
         """
         base_url = self._get_base_url()
         api_url = f"{base_url}/v1/chat/completions"
-        model = self.conf.get("grok_video_model", "grok-imagine-1.0-video")
+        configured_model = self.conf.get("grok_video_model", "grok-imagine-1.0-video")
+        model = await self._resolve_model(
+            configured_model=configured_model,
+            fallback_models=["grok-imagine-1.0-video"],
+            scene="生视频",
+        )
+        if video_length not in self.SUPPORTED_VIDEO_LENGTH_SECONDS:
+            video_length = self.DEFAULT_VIDEO_LENGTH_SECONDS
 
-        mime_type = self._detect_mime_type(image_bytes)
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
+        enhanced_prompt = self._build_video_prompt(prompt, has_reference_image=bool(image_bytes))
+        content_blocks: List[Dict[str, Any]] = [{"type": "text", "text": enhanced_prompt}]
+        if image_bytes:
+            mime_type = self._detect_mime_type(image_bytes)
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            content_blocks.append(
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
-            ]
-        }]
+            )
 
-        resolution_candidates = [resolution_name or "720p"]
-        if resolution_candidates[0] != "720p":
-            resolution_candidates.append("720p")
+        messages = [{"role": "user", "content": content_blocks}]
+
+        # 优先尝试增强参数；若后端不支持 preset，再自动降级到基础参数
+        video_config_candidates: List[Dict[str, Any]] = [
+            {
+                "aspect_ratio": target_size,
+                "resolution_name": self.VIDEO_RESOLUTION_NAME,
+                "video_length": video_length,
+                "preset": "custom",
+            },
+            {
+                "aspect_ratio": target_size,
+                "resolution_name": self.VIDEO_RESOLUTION_NAME,
+                "video_length": video_length,
+            },
+        ]
 
         last_error: Optional[str] = None
-        for current_resolution in resolution_candidates:
+        for config_index, current_video_config in enumerate(video_config_candidates):
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": True,
-                "video_config": {
-                    "aspect_ratio": aspect_ratio,
-                    "resolution_name": current_resolution,
-                },
+                "video_config": current_video_config,
             }
 
-            need_fallback_resolution = False
-            for attempt in range(3):
+            need_fallback_config = False
+            for attempt in range(self.MAX_REQUEST_RETRIES):
                 try:
                     session = await self._ensure_session()
                     async with session.post(
@@ -725,29 +982,35 @@ class GrokPlugin(Star):
                             translated_error = self._translate_error(detail or f"状态码: {resp.status}")
                             last_error = translated_error
 
-                            if resp.status >= 500 and attempt < 2:
-                                await asyncio.sleep(2)
+                            if (
+                                self._is_retryable_status(resp.status)
+                                and attempt < self.MAX_REQUEST_RETRIES - 1
+                            ):
+                                await asyncio.sleep(self._retry_delay_seconds(attempt))
                                 continue
 
+                            detail_lower = (detail or "").lower()
                             if (
-                                current_resolution != "720p"
+                                config_index < len(video_config_candidates) - 1
+                                and current_video_config.get("preset")
                                 and (
-                                    self._is_resolution_related_error(detail)
-                                    or resp.status == 400
+                                    resp.status == 400
+                                    or "preset" in detail_lower
+                                    or "video_config" in detail_lower
                                 )
                             ):
                                 logger.warning(
-                                    f"[图生视频] resolution_name={current_resolution} 不可用，回退到 720p: {detail[:120]}"
+                                    f"[图生视频] 增强参数不可用，回退基础参数: {detail[:120]}"
                                 )
-                                need_fallback_resolution = True
+                                need_fallback_config = True
                                 break
 
                             return None, translated_error
 
                         media_bytes, media_url, error = await self._parse_media_response(resp, "video")
                         if error:
-                            if attempt < 2:
-                                await asyncio.sleep(2)
+                            if attempt < self.MAX_REQUEST_RETRIES - 1:
+                                await asyncio.sleep(self._retry_delay_seconds(attempt))
                                 continue
                             return None, error
                         if media_bytes:
@@ -762,18 +1025,18 @@ class GrokPlugin(Star):
                         return None, "API 响应中未包含有效视频内容"
 
                 except (asyncio.TimeoutError, aiohttp.ClientError):
-                    if attempt == 2:
+                    if attempt == self.MAX_REQUEST_RETRIES - 1:
                         last_error = "请求超时，请重试"
                     else:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(self._retry_delay_seconds(attempt))
                 except Exception as e:
-                    if attempt == 2:
+                    if attempt == self.MAX_REQUEST_RETRIES - 1:
                         logger.error(f"[图生视频] 请求异常: {e}")
                         last_error = self._translate_error(str(e))
                     else:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(self._retry_delay_seconds(attempt))
 
-            if need_fallback_resolution:
+            if need_fallback_config:
                 continue
             if last_error:
                 return None, last_error
@@ -1183,11 +1446,20 @@ class GrokPlugin(Star):
         """是否启用 Skill 模式"""
         return self._to_bool(self.conf.get("grok_search_enable_skill", False), False)
 
-    async def _perform_web_search(self, query: str, image_bytes: Optional[bytes] = None) -> Dict[str, Any]:
-        """执行联网搜索/对话，支持图片理解"""
+    async def _perform_web_search(
+        self,
+        query: str,
+        multimodal_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """执行联网搜索/对话，支持图像、音频、文件理解"""
         started = time.time()
         query = (query or "").strip()
-        if not query and not image_bytes:
+        multimodal_inputs = multimodal_inputs or {}
+        image_bytes: Optional[bytes] = multimodal_inputs.get("image_bytes")
+        audio_inputs: List[Dict[str, str]] = multimodal_inputs.get("audio_inputs", []) or []
+        file_inputs: List[Dict[str, str]] = multimodal_inputs.get("file_inputs", []) or []
+
+        if not query and not image_bytes and not audio_inputs and not file_inputs:
             return {
                 "ok": False,
                 "error": "请输入问题内容",
@@ -1218,7 +1490,14 @@ class GrokPlugin(Star):
                 "elapsed_ms": int((time.time() - started) * 1000),
             }
 
-        model = str(self.conf.get("grok_search_model", self.DEFAULT_SEARCH_MODEL)).strip() or self.DEFAULT_SEARCH_MODEL
+        configured_model = str(
+            self.conf.get("grok_search_model", self.DEFAULT_SEARCH_MODEL)
+        ).strip() or self.DEFAULT_SEARCH_MODEL
+        model = await self._resolve_model(
+            configured_model=configured_model,
+            fallback_models=[self.DEFAULT_SEARCH_MODEL, "grok-4", "grok-3"],
+            scene="对话/搜索",
+        )
         timeout = self._to_float(self.conf.get("grok_search_timeout_seconds", self.DEFAULT_SEARCH_TIMEOUT), self.DEFAULT_SEARCH_TIMEOUT)
         if timeout <= 0:
             timeout = self.DEFAULT_SEARCH_TIMEOUT
@@ -1264,15 +1543,52 @@ class GrokPlugin(Star):
             )
             search_parameters = {"mode": "auto"}
 
-        # 构建用户消息（支持多模态）
-        if image_bytes:
-            mime_type = self._detect_mime_type(image_bytes)
-            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-            user_content = [
-                {"type": "text", "text": query or "请描述这张图片"},
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+        has_multimodal = bool(image_bytes or audio_inputs or file_inputs)
+        if has_multimodal:
+            user_content: List[Dict[str, Any]] = [
+                {"type": "text", "text": query or "请分析我发送的内容"}
             ]
         else:
+            user_content = []
+
+        # 构建用户消息（支持多模态）
+        if image_bytes and has_multimodal:
+            mime_type = self._detect_mime_type(image_bytes)
+            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+            user_content.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+            )
+
+        if has_multimodal:
+            for audio in audio_inputs:
+                audio_data = str(audio.get("data", "")).strip()
+                audio_format = str(audio.get("format", "mp3")).strip() or "mp3"
+                if not audio_data:
+                    continue
+                user_content.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio_data, "format": audio_format},
+                    }
+                )
+
+            for file_item in file_inputs:
+                file_payload: Dict[str, str] = {}
+                file_url = str(file_item.get("url", "")).strip()
+                file_data = str(file_item.get("data", "")).strip()
+                if file_url:
+                    file_payload["file_url"] = file_url
+                elif file_data:
+                    file_payload["file_data"] = file_data
+                else:
+                    continue
+
+                filename = str(file_item.get("filename", "")).strip()
+                if filename:
+                    file_payload["filename"] = filename
+                user_content.append({"type": "file", "file": file_payload})
+
+        if not has_multimodal:
             user_content = query
 
         payload: Dict[str, Any] = {
@@ -1308,116 +1624,129 @@ class GrokPlugin(Star):
         api_url = f"{self._get_base_url()}/v1/chat/completions"
         raw_text = ""
 
-        try:
-            session = await self._ensure_session()
-            async with session.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                raw_text = await resp.text()
-                if resp.status != 200:
-                    logger.warning(f"[对话/搜索] HTTP {resp.status}: {raw_text[:500]}")
+        for attempt in range(self.MAX_REQUEST_RETRIES):
+            try:
+                session = await self._ensure_session()
+                async with session.post(
+                    api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    raw_text = await resp.text()
+                    if resp.status != 200:
+                        logger.warning(f"[对话/搜索] HTTP {resp.status}: {raw_text[:500]}")
+                        if (
+                            self._is_retryable_status(resp.status)
+                            and attempt < self.MAX_REQUEST_RETRIES - 1
+                        ):
+                            await asyncio.sleep(self._retry_delay_seconds(attempt))
+                            continue
+                        return {
+                            "ok": False,
+                            "error": self._translate_error(f"状态码: {resp.status}"),
+                            "content": "",
+                            "sources": [],
+                            "raw": raw_text[:2000] if raw_text else "",
+                            "elapsed_ms": int((time.time() - started) * 1000),
+                        }
+
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError:
                     return {
                         "ok": False,
-                        "error": self._translate_error(f"状态码: {resp.status}"),
+                        "error": "响应解析失败，API 返回了非 JSON 格式的数据",
                         "content": "",
                         "sources": [],
                         "raw": raw_text[:2000] if raw_text else "",
                         "elapsed_ms": int((time.time() - started) * 1000),
                     }
 
-            try:
-                data = json.loads(raw_text)
-            except json.JSONDecodeError:
+                if "error" in data and isinstance(data.get("error"), (dict, str)):
+                    error_info = data["error"]
+                    error_msg = (
+                        error_info.get("message", str(error_info))
+                        if isinstance(error_info, dict)
+                        else str(error_info)
+                    )
+                    return {
+                        "ok": False,
+                        "error": self._translate_error(error_msg),
+                        "content": "",
+                        "sources": [],
+                        "raw": raw_text[:2000] if raw_text else "",
+                        "elapsed_ms": int((time.time() - started) * 1000),
+                    }
+
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list):
+                    return {
+                        "ok": False,
+                        "error": "响应缺少 choices 字段",
+                        "content": "",
+                        "sources": [],
+                        "raw": raw_text[:2000] if raw_text else "",
+                        "elapsed_ms": int((time.time() - started) * 1000),
+                    }
+
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                message = choice.get("message") if isinstance(choice, dict) else {}
+                content, sources, raw = self._parse_search_message((message or {}).get("content"))
+
+                if not content:
+                    return {
+                        "ok": False,
+                        "error": "API 返回了空响应",
+                        "content": "",
+                        "sources": [],
+                        "raw": raw_text[:2000] if raw_text else "",
+                        "elapsed_ms": int((time.time() - started) * 1000),
+                    }
+
+                return {
+                    "ok": True,
+                    "content": content,
+                    "sources": sources,
+                    "raw": raw,
+                    "model": data.get("model") or model,
+                    "usage": data.get("usage") or {},
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                }
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                if attempt < self.MAX_REQUEST_RETRIES - 1:
+                    await asyncio.sleep(self._retry_delay_seconds(attempt))
+                    continue
                 return {
                     "ok": False,
-                    "error": "响应解析失败，API 返回了非 JSON 格式的数据",
+                    "error": self._translate_error(str(exc) or "请求超时，请稍后重试"),
                     "content": "",
                     "sources": [],
-                    "raw": raw_text[:2000] if raw_text else "",
+                    "raw": "",
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                }
+            except Exception as exc:
+                if attempt < self.MAX_REQUEST_RETRIES - 1:
+                    await asyncio.sleep(self._retry_delay_seconds(attempt))
+                    continue
+                logger.error(f"[联网搜索] 请求异常: {exc}")
+                return {
+                    "ok": False,
+                    "error": self._translate_error(str(exc)),
+                    "content": "",
+                    "sources": [],
+                    "raw": "",
                     "elapsed_ms": int((time.time() - started) * 1000),
                 }
 
-            if "error" in data and isinstance(data.get("error"), (dict, str)):
-                error_info = data["error"]
-                error_msg = (
-                    error_info.get("message", str(error_info))
-                    if isinstance(error_info, dict)
-                    else str(error_info)
-                )
-                return {
-                    "ok": False,
-                    "error": self._translate_error(error_msg),
-                    "content": "",
-                    "sources": [],
-                    "raw": raw_text[:2000] if raw_text else "",
-                    "elapsed_ms": int((time.time() - started) * 1000),
-                }
-
-            choices = data.get("choices")
-            if not choices or not isinstance(choices, list):
-                return {
-                    "ok": False,
-                    "error": "响应缺少 choices 字段",
-                    "content": "",
-                    "sources": [],
-                    "raw": raw_text[:2000] if raw_text else "",
-                    "elapsed_ms": int((time.time() - started) * 1000),
-                }
-
-            choice = choices[0] if isinstance(choices[0], dict) else {}
-            message = choice.get("message") if isinstance(choice, dict) else {}
-            content, sources, raw = self._parse_search_message((message or {}).get("content"))
-
-            if not content:
-                return {
-                    "ok": False,
-                    "error": "API 返回了空响应",
-                    "content": "",
-                    "sources": [],
-                    "raw": raw_text[:2000] if raw_text else "",
-                    "elapsed_ms": int((time.time() - started) * 1000),
-                }
-
-            return {
-                "ok": True,
-                "content": content,
-                "sources": sources,
-                "raw": raw,
-                "model": data.get("model") or model,
-                "usage": data.get("usage") or {},
-                "elapsed_ms": int((time.time() - started) * 1000),
-            }
-        except asyncio.TimeoutError:
-            return {
-                "ok": False,
-                "error": "请求超时，请稍后重试",
-                "content": "",
-                "sources": [],
-                "raw": "",
-                "elapsed_ms": int((time.time() - started) * 1000),
-            }
-        except aiohttp.ClientError as exc:
-            return {
-                "ok": False,
-                "error": self._translate_error(str(exc)),
-                "content": "",
-                "sources": [],
-                "raw": "",
-                "elapsed_ms": int((time.time() - started) * 1000),
-            }
-        except Exception as exc:
-            logger.error(f"[联网搜索] 请求异常: {exc}")
-            return {
-                "ok": False,
-                "error": self._translate_error(str(exc)),
-                "content": "",
-                "sources": [],
-                "raw": "",
-                "elapsed_ms": int((time.time() - started) * 1000),
-            }
+        return {
+            "ok": False,
+            "error": "请求失败，请稍后重试",
+            "content": "",
+            "sources": [],
+            "raw": "",
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
 
     def _format_search_result(self, result: Dict[str, Any]) -> str:
         """格式化搜索结果为用户友好的消息（纯文本，无 Markdown）"""
@@ -1517,22 +1846,113 @@ class GrokPlugin(Star):
                 return None
         return None
 
+    def _iter_event_segments(self, event: AstrMessageEvent) -> List[Any]:
+        """展开消息链与引用链，返回统一的消息段列表"""
+        message_list = getattr(getattr(event, "message_obj", None), "message", None) or []
+        segments: List[Any] = []
+        for seg in message_list:
+            if self._is_segment_type(seg, "Reply") and getattr(seg, "chain", None):
+                for inner in seg.chain:
+                    segments.append(inner)
+            else:
+                segments.append(seg)
+        return segments
+
+    async def _load_segment_payload(self, seg: Any) -> Tuple[Optional[bytes], Optional[str]]:
+        """从消息段中读取媒体数据，返回 (bytes, source)"""
+        direct_data = getattr(seg, "data", None)
+        if isinstance(direct_data, (bytes, bytearray)) and direct_data:
+            return bytes(direct_data), None
+
+        for src in self._extract_segment_sources(seg):
+            payload = await self._load_bytes(src)
+            if payload:
+                return payload, src
+        return None, None
+
+    async def _get_images_from_event(
+        self,
+        event: AstrMessageEvent,
+        max_count: int = 1,
+    ) -> List[bytes]:
+        images: List[bytes] = []
+        if max_count <= 0:
+            return images
+
+        for seg in self._iter_event_segments(event):
+            if not self._is_segment_type(seg, "Image"):
+                continue
+            payload, _ = await self._load_segment_payload(seg)
+            if payload:
+                images.append(payload)
+                if len(images) >= max_count:
+                    break
+        return images
+
     async def _get_image_from_event(self, event: AstrMessageEvent) -> Optional[bytes]:
-        for seg in event.message_obj.message:
-            if isinstance(seg, Comp.Reply) and seg.chain:
-                for s in seg.chain:
-                    if isinstance(s, Comp.Image):
-                        if s.url and (img := await self._load_bytes(s.url)):
-                            return img
-                        if s.file and (img := await self._load_bytes(s.file)):
-                            return img
-        for seg in event.message_obj.message:
-            if isinstance(seg, Comp.Image):
-                if seg.url and (img := await self._load_bytes(seg.url)):
-                    return img
-                if seg.file and (img := await self._load_bytes(seg.file)):
-                    return img
+        images = await self._get_images_from_event(event, max_count=1)
+        if images:
+            return images[0]
         return None
+
+    async def _collect_multimodal_inputs(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        """收集对话命令中的多模态输入（图像/音频/文件）"""
+        images = await self._get_images_from_event(event, max_count=1)
+        image_bytes = images[0] if images else None
+
+        audio_inputs: List[Dict[str, str]] = []
+        file_inputs: List[Dict[str, str]] = []
+
+        for seg in self._iter_event_segments(event):
+            is_audio = (
+                self._is_segment_type(seg, "Record")
+                or self._is_segment_type(seg, "Audio")
+                or self._is_segment_type(seg, "Voice")
+            )
+            is_file = self._is_segment_type(seg, "File")
+
+            if not is_audio and not is_file:
+                continue
+
+            sources = self._extract_segment_sources(seg)
+            payload, source = await self._load_segment_payload(seg)
+            if not source and sources:
+                source = sources[0]
+            if not payload:
+                if is_file:
+                    file_url = next((s for s in sources if s.startswith("http")), "")
+                    if file_url:
+                        file_inputs.append(
+                            {
+                                "filename": self._guess_filename_from_source(file_url, "upload.bin"),
+                                "url": file_url,
+                            }
+                        )
+                continue
+
+            if is_audio:
+                audio_inputs.append(
+                    {
+                        "format": self._guess_audio_format_from_source(source),
+                        "data": base64.b64encode(payload).decode("utf-8"),
+                    }
+                )
+                continue
+
+            filename = self._guess_filename_from_source(source, "upload.bin")
+            mime_type = self._guess_mime_type_from_source(source, "application/octet-stream")
+            file_inputs.append(
+                {
+                    "filename": filename,
+                    "data": f"data:{mime_type};base64,{base64.b64encode(payload).decode('utf-8')}",
+                }
+            )
+
+        return {
+            "image_bytes": image_bytes,
+            "audio_inputs": audio_inputs,
+            "file_inputs": file_inputs,
+        }
 
     async def _save_and_send_media(self, event: AstrMessageEvent, url: str,
                                     media_bytes: bytes, media_type: str = "image"):
@@ -1665,50 +2085,105 @@ class GrokPlugin(Star):
 
     # ==================== 参数解析 ====================
 
-    def _get_aspect_ratio_from_image(self, image_bytes: bytes) -> Optional[str]:
-        """从图片字节识别宽高比，返回最接近的支持比例"""
-        resolution = self._get_image_resolution(image_bytes)
-        if not resolution:
-            return None
-        return self._get_aspect_ratio_from_dimensions(*resolution)
-
-    def _parse_image_params(self, text: str) -> Tuple[str, Dict[str, Any]]:
-        """解析生图参数: [数量] [比例] 提示词（顺序任意）
+    def _parse_image_params(self, text: str, strict_size: bool = True) -> Tuple[str, Dict[str, Any]]:
+        """解析生图参数: [数量] [尺寸] 提示词（顺序任意）
 
         规则：
         - 只识别开头连续的独立参数词
         - 数量: 1-10 的独立数字
-        - 比例: ASPECT_RATIOS 中的关键词
+        - 尺寸: WxH（必须是 SUPPORTED_IMAGE_SIZES 中的合法尺寸）
         - 遇到非参数词立即停止，后续全部作为提示词
         - 每种参数最多识别一次
         """
-        params = {"n": 1, "aspect_ratio": self.DEFAULT_ASPECT_RATIO, "aspect_ratio_specified": False}
+        params = {
+            "n": 1,
+            "size": self.DEFAULT_TEXT_IMAGE_SIZE,
+            "invalid_size": None,
+        }
         parts = text.split()
         if not parts:
             return "", params
 
         prompt_start = 0
         found_n = False
-        found_ratio = False
+        found_size = False
 
-        # 最多检查前2个词（数量+比例，顺序任意）
+        # 最多检查前2个词（数量+尺寸，顺序任意）
         for i in range(min(2, len(parts))):
             p = parts[i]
 
             # 检查是否为数量(1-10的独立数字)
-            if not found_n and p.isdigit() and 1 <= int(p) <= 10:
+            if not found_n and p.isdigit() and 1 <= int(p) <= self.MAX_IMAGE_COUNT:
                 params["n"] = int(p)
                 prompt_start = i + 1
                 found_n = True
-            # 检查是否为比例
-            elif not found_ratio and p in self.ASPECT_RATIOS:
-                params["aspect_ratio"] = self.ASPECT_RATIOS[p]
-                params["aspect_ratio_specified"] = True
-                prompt_start = i + 1
-                found_ratio = True
+            # 检查是否为尺寸
+            elif not found_size:
+                normalized = self._normalize_supported_size(p)
+                if normalized:
+                    params["size"] = normalized
+                    prompt_start = i + 1
+                    found_size = True
+                    continue
+
+                parsed_size = self._parse_size_string(p)
+                if parsed_size and strict_size:
+                    params["invalid_size"] = self._format_size(parsed_size[0], parsed_size[1])
+                    prompt_start = i + 1
+                    found_size = True
+                    continue
+                break
             else:
                 # 遇到非参数词，停止解析
                 break
+
+        prompt = " ".join(parts[prompt_start:]).strip()
+        return prompt, params
+
+    def _parse_video_params(self, text: str, strict_size: bool = True) -> Tuple[str, Dict[str, Any]]:
+        """解析生视频参数: [尺寸] [时长] 提示词（顺序任意）"""
+        params = {
+            "size": self.DEFAULT_VIDEO_SIZE,
+            "invalid_size": None,
+            "duration_seconds": self.DEFAULT_VIDEO_LENGTH_SECONDS,
+        }
+        parts = text.split()
+        if not parts:
+            return "", params
+
+        prompt_start = 0
+        found_size = False
+        found_duration = False
+
+        # 最多识别前2个词（尺寸+时长，顺序任意）
+        for i in range(min(2, len(parts))):
+            p = parts[i]
+
+            if not found_size:
+                normalized = self._normalize_supported_size(p)
+                if normalized:
+                    params["size"] = normalized
+                    prompt_start = i + 1
+                    found_size = True
+                    continue
+
+            if not found_duration:
+                parsed_duration = self._parse_video_length_token(p)
+                if parsed_duration:
+                    params["duration_seconds"] = parsed_duration
+                    prompt_start = i + 1
+                    found_duration = True
+                    continue
+
+            if not found_size:
+                parsed_size = self._parse_size_string(p)
+                if parsed_size and strict_size:
+                    params["invalid_size"] = self._format_size(parsed_size[0], parsed_size[1])
+                    prompt_start = i + 1
+                    found_size = True
+                    continue
+
+            break
 
         prompt = " ".join(parts[prompt_start:]).strip()
         return prompt, params
@@ -1717,7 +2192,7 @@ class GrokPlugin(Star):
 
     @filter.command("grok生图", prefix_optional=True)
     async def on_image_request(self, event: AstrMessageEvent):
-        """Grok 生图: /grok生图 [数量] [比例] <提示词> [+图片可选]"""
+        """Grok 生图: /grok生图 [数量] [尺寸] <提示词> [+图片可选]"""
         api_key = self.conf.get("grok_api_key", "").strip()
         if not api_key:
             yield event.plain_result("❌ 未配置 API 密钥")
@@ -1740,7 +2215,12 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 当前会话无权限使用此功能")
             return
 
-        prompt_text, params = self._parse_image_params(user_input)
+        image_inputs = await self._get_images_from_event(event, max_count=2)
+        image_bytes = image_inputs[0] if image_inputs else None
+        mask_bytes = image_inputs[1] if len(image_inputs) > 1 else None
+        mode = "图生图" if image_bytes else "文生图"
+
+        prompt_text, params = self._parse_image_params(user_input, strict_size=not image_bytes)
         if not prompt_text:
             yield event.plain_result("❌ 请输入提示词")
             return
@@ -1749,12 +2229,16 @@ class GrokPlugin(Star):
             yield event.plain_result(f"❌ 提示词过长，最大支持 {self.MAX_PROMPT_LENGTH} 字符")
             return
 
-        image_bytes = await self._get_image_from_event(event)
-        mode = "图生图" if image_bytes else "文生图"
-
         n = params["n"]
-        ratio = params["aspect_ratio"]
-        ratio_specified = bool(params.get("aspect_ratio_specified", False))
+        requested_size = params["size"]
+        invalid_size = params.get("invalid_size")
+
+        if not image_bytes and invalid_size:
+            supported_sizes = "、".join(self.SUPPORTED_IMAGE_SIZES)
+            yield event.plain_result(
+                f"❌ 不支持的尺寸: {invalid_size}\n支持尺寸: {supported_sizes}"
+            )
+            return
 
         source_resolution = None
         target_size = None
@@ -1762,31 +2246,20 @@ class GrokPlugin(Star):
             source_resolution = self._get_image_resolution(image_bytes)
             if source_resolution:
                 target_size = self._get_closest_supported_size(*source_resolution)
-            if not target_size:
-                target_size = self._get_size_for_aspect_ratio(ratio, prefer_high_resolution=True)
-            if target_size:
-                ratio = self._get_aspect_ratio_from_size(target_size) or ratio
         else:
-            if ratio_specified:
-                target_size = self._get_size_for_aspect_ratio(ratio, prefer_high_resolution=True)
-            else:
-                target_size = self.DEFAULT_TEXT_IMAGE_SIZE
-                ratio = self._get_aspect_ratio_from_size(target_size) or ratio
+            target_size = requested_size
 
         if not target_size:
             target_size = self.DEFAULT_TEXT_IMAGE_SIZE
-            ratio = self._get_aspect_ratio_from_size(target_size) or ratio
 
-        if source_resolution:
-            source_size_str = self._format_size(source_resolution[0], source_resolution[1])
-            yield event.plain_result(
-                f"🎨 正在进行 [{mode}] · {n}张 · {ratio} · {source_size_str}→{target_size} ..."
-            )
-        else:
-            yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {ratio} · {target_size} ...")
+        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {target_size} ...")
 
         results, error = await self._generate_image(
-            prompt_text, image_bytes, n=n, aspect_ratio=ratio, target_size=target_size
+            prompt_text,
+            image_bytes,
+            mask_bytes=mask_bytes,
+            n=n,
+            target_size=target_size,
         )
 
         if error:
@@ -1827,7 +2300,7 @@ class GrokPlugin(Star):
 
     @filter.command("grok视频", prefix_optional=True)
     async def on_video_request(self, event: AstrMessageEvent):
-        """Grok 图生视频: /grok视频 <提示词> + 图片"""
+        """Grok 生视频: /grok视频 [尺寸] [时长] <提示词> [+图片可选]"""
         api_key = self.conf.get("grok_api_key", "").strip()
         if not api_key:
             yield event.plain_result("❌ 未配置 API 密钥")
@@ -1837,16 +2310,12 @@ class GrokPlugin(Star):
         raw_input = event.message_str.strip()
         cmd = "grok视频"
         if raw_input.startswith(cmd):
-            prompt_text = raw_input[len(cmd):].strip()
+            user_input = raw_input[len(cmd):].strip()
         else:
-            prompt_text = raw_input
+            user_input = raw_input
 
-        if not prompt_text:
+        if not user_input:
             yield event.plain_result("❌ 请输入提示词\n示例: /grok视频 让画面动起来")
-            return
-
-        if len(prompt_text) > self.MAX_PROMPT_LENGTH:
-            yield event.plain_result(f"❌ 提示词过长，最大支持 {self.MAX_PROMPT_LENGTH} 字符")
             return
 
         can_proceed, _ = await self._check_permissions(event)
@@ -1855,38 +2324,48 @@ class GrokPlugin(Star):
             return
 
         image_bytes = await self._get_image_from_event(event)
-        if not image_bytes:
-            yield event.plain_result("❌ 需要图片，请上传或引用图片")
+        mode = "图生视频" if image_bytes else "文生视频"
+        prompt_text, params = self._parse_video_params(user_input, strict_size=not image_bytes)
+
+        if not image_bytes and params.get("invalid_size"):
+            supported_sizes = "、".join(self.SUPPORTED_IMAGE_SIZES)
+            yield event.plain_result(
+                f"❌ 不支持的尺寸: {params['invalid_size']}\n支持尺寸: {supported_sizes}"
+            )
             return
 
-        source_resolution = self._get_image_resolution(image_bytes)
-        target_size = None
-        if source_resolution:
-            target_size = self._get_closest_supported_size(*source_resolution)
-        if not target_size:
-            target_size = self._get_size_for_aspect_ratio(self.DEFAULT_ASPECT_RATIO, prefer_high_resolution=True)
-        if not target_size:
-            target_size = self.DEFAULT_TEXT_IMAGE_SIZE
+        if not prompt_text:
+            yield event.plain_result("❌ 请输入提示词")
+            return
 
-        aspect_ratio = self._get_aspect_ratio_from_size(target_size) or self.DEFAULT_ASPECT_RATIO
-        resolution_name = self._get_video_resolution_name(target_size)
+        if len(prompt_text) > self.MAX_PROMPT_LENGTH:
+            yield event.plain_result(f"❌ 提示词过长，最大支持 {self.MAX_PROMPT_LENGTH} 字符")
+            return
 
-        if source_resolution:
-            source_size_str = self._format_size(source_resolution[0], source_resolution[1])
-            yield event.plain_result(
-                f"🎬 正在进行 [图生视频] · {source_size_str}→{target_size} · {aspect_ratio} · {resolution_name} ..."
-            )
-        else:
-            yield event.plain_result(
-                f"🎬 正在进行 [图生视频] · {target_size} · {aspect_ratio} · {resolution_name} ..."
-            )
+        target_size = params["size"]
+        video_length_seconds = int(params.get("duration_seconds", self.DEFAULT_VIDEO_LENGTH_SECONDS))
+        if image_bytes:
+            source_resolution = self._get_image_resolution(image_bytes)
+            if source_resolution:
+                target_size = self._get_closest_supported_size(*source_resolution) or target_size
+        if not target_size:
+            target_size = self.DEFAULT_VIDEO_SIZE
+
+        video_target_size = target_size or self.DEFAULT_VIDEO_SIZE
+
+        yield event.plain_result(
+            f"🎬 正在进行 [{mode}] · {video_length_seconds}秒 · {target_size} ..."
+        )
 
         video_result, error = await self._generate_video(
-            prompt_text, image_bytes, aspect_ratio, resolution_name
+            prompt_text,
+            image_bytes,
+            video_target_size,
+            video_length=video_length_seconds,
         )
 
         if error:
-            yield event.plain_result(f"❌ [图生视频] 生成失败: {self._translate_error(error)}")
+            yield event.plain_result(f"❌ [{mode}] 生成失败: {self._translate_error(error)}")
             return
 
         if not video_result:
@@ -1935,38 +2414,43 @@ class GrokPlugin(Star):
         help_text = (
             "【Grok AI 助手】\n\n"
             "🎨 生图命令:\n"
-            "/grok生图 [数量] [比例] 提示词\n"
+            "/grok生图 [数量] [尺寸] 提示词\n"
             "• 数量: 1-10 (默认1)\n"
-            "• 比例: 横/竖/方/16:9/9:16/1:1/3:2/2:3 (默认竖)\n"
-            "• 3:2/2:3 会自动映射到最近合法尺寸\n"
-            "• 可附带图片进行图生图\n\n"
+            "• 尺寸: 1024x1024 / 1024x1792 / 1280x720 / 1792x1024 / 720x1280\n"
+            "• 不传尺寸时默认 1024x1792\n"
+            "• 可附带图片进行图生图；附带两张图时第2张作为局部重绘蒙版\n\n"
             "示例:\n"
             "• /grok生图 一只猫\n"
-            "• /grok生图 4 横 日落海滩\n"
+            "• /grok生图 4 1792x1024 日落海滩\n"
             "• /grok生图 把背景换成森林 +图片\n\n"
             "━━━━━━━━━━━━━━\n"
             "🎬 视频命令:\n"
-            "/grok视频 提示词 + 图片\n"
-            "• 自动读取原图分辨率并匹配最近合法尺寸\n"
-            "• 分辨率档位自动选择，必要时回落到 720p\n\n"
+            "/grok视频 [尺寸] [时长] 提示词 [+图片可选]\n"
+            "• 文生视频默认尺寸 1280x720\n"
+            "• 时长支持 6/10/15 秒，默认 6 秒\n"
+            "• 图生视频自动读取原图分辨率并匹配最近合法尺寸\n"
+            "• 固定 720p 输出，并自动启用增强策略\n\n"
             "示例:\n"
             "• /grok视频 让画面动起来\n"
+            "• /grok视频 10 夜晚海边慢镜头\n"
+            "• /grok视频 1280x720 让城市霓虹缓慢流动\n"
             "• /grok视频 让人物眨眼微笑\n\n"
             "━━━━━━━━━━━━━━\n"
             "💬 对话命令:\n"
-            "/grok <内容> [+图片可选]\n"
+            "/grok <内容> [+图片/语音/文件可选]\n"
             "• 智能对话，可自动联网获取最新信息\n"
-            "• 可附带图片进行图片理解\n\n"
+            "• 支持附带图片、语音、文件进行多模态理解\n\n"
             "示例:\n"
             "• /grok 你好，介绍一下你自己\n"
             "• /grok 今天有什么新闻\n"
-            "• /grok 这张图片里有什么 +图片"
+            "• /grok 这张图片里有什么 +图片\n"
+            "• /grok 帮我总结这个语音和文件 +语音/+文件"
         )
         yield event.plain_result(help_text)
 
     @filter.command("grok", prefix_optional=True)
     async def on_web_search(self, event: AstrMessageEvent):
-        """Grok 对话/搜索: /grok <内容> [+图片可选]"""
+        """Grok 对话/搜索: /grok <内容> [+图片/语音/文件可选]"""
         raw_input = event.message_str.strip()
         normalized_input = raw_input.lstrip("/")
         # 避免与其他 grok 命令冲突
@@ -1981,15 +2465,23 @@ class GrokPlugin(Star):
         cmd = "grok"
         query = normalized_input[len(cmd):].strip() if normalized_input.startswith(cmd) else normalized_input
 
-        # 检测图片
-        image_bytes = await self._get_image_from_event(event)
+        multimodal_inputs = await self._collect_multimodal_inputs(event)
+        has_multimodal = bool(
+            multimodal_inputs.get("image_bytes")
+            or multimodal_inputs.get("audio_inputs")
+            or multimodal_inputs.get("file_inputs")
+        )
 
-        if not query and not image_bytes:
-            yield event.plain_result("使用方法: /grok <问题内容> [+图片可选]\n输入 /grok帮助 查看完整说明")
+        if not query and not has_multimodal:
+            yield event.plain_result(
+                "使用方法: /grok <问题内容> [+图片/语音/文件可选]\n输入 /grok帮助 查看完整说明"
+            )
             return
 
         if query.lower() == "help" or query == "帮助":
-            yield event.plain_result("使用方法: /grok <问题内容> [+图片可选]\n输入 /grok帮助 查看完整说明")
+            yield event.plain_result(
+                "使用方法: /grok <问题内容> [+图片/语音/文件可选]\n输入 /grok帮助 查看完整说明"
+            )
             return
 
         api_key = self.conf.get("grok_api_key", "").strip()
@@ -1997,7 +2489,7 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 未配置 API 密钥")
             return
 
-        result = await self._perform_web_search(query, image_bytes)
+        result = await self._perform_web_search(query, multimodal_inputs)
         yield event.plain_result(self._format_search_result(result))
 
     @filter.llm_tool(name="grok_web_search")
