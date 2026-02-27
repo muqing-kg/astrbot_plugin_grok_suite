@@ -35,8 +35,8 @@ except ImportError:
 class GrokPlugin(Star):
     """Grok 多媒体与联网搜索插件 - 支持生图、生视频、联网搜索"""
 
-    DEFAULT_TEXT_IMAGE_SIZE = "1024x1792"
-    DEFAULT_VIDEO_SIZE = "1280x720"
+    DEFAULT_TEXT_IMAGE_SIZE = "720x1280"  # 9:16 竖屏
+    DEFAULT_VIDEO_SIZE = "1792x1024"      # 3:2 横构图
     DEFAULT_VIDEO_LENGTH_SECONDS = 6
     SUPPORTED_VIDEO_LENGTH_SECONDS = (6, 10, 15)
     VIDEO_RESOLUTION_NAME = "720p"
@@ -47,6 +47,13 @@ class GrokPlugin(Star):
         "1792x1024",
         "720x1280",
     )
+    SIZE_TO_ASPECT_RATIO = {
+        "1280x720": "16:9",
+        "720x1280": "9:16",
+        "1792x1024": "3:2",
+        "1024x1792": "2:3",
+        "1024x1024": "1:1",
+    }
     DEFAULT_SEARCH_MODEL = "grok-4-fast"
     DEFAULT_SEARCH_TIMEOUT = 60.0
     DEFAULT_SEARCH_THINKING_BUDGET = 32000
@@ -517,6 +524,38 @@ class GrokPlugin(Star):
         best = min(candidates, key=distance)
         return best[0]
 
+    @classmethod
+    def _size_to_aspect_ratio(cls, size: str) -> str:
+        """将像素尺寸转换为宽高比
+
+        Args:
+            size: 像素尺寸字符串（如 "1280x720"）或比例字符串（如 "16:9"）
+
+        Returns:
+            宽高比字符串，如 "16:9"
+        """
+        if size in cls.SIZE_TO_ASPECT_RATIO:
+            return cls.SIZE_TO_ASPECT_RATIO[size]
+        if ":" in size:
+            parts = size.split(":")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                return size
+        return "16:9"
+
+    @classmethod
+    def _get_aspect_ratio_display(cls, size: str) -> str:
+        """获取尺寸的比例显示（用于用户提示）
+
+        Args:
+            size: 像素尺寸字符串（如 "1280x720"）
+
+        Returns:
+            比例字符串，如 "16:9"，如果无法识别则返回原始尺寸
+        """
+        if size in cls.SIZE_TO_ASPECT_RATIO:
+            return cls.SIZE_TO_ASPECT_RATIO[size]
+        return size
+
     def _build_video_prompt(self, prompt: str, has_reference_image: bool) -> str:
         """构建视频增强提示词，默认开启细节与稳定性增强"""
         enhancement_hint = (
@@ -959,13 +998,13 @@ class GrokPlugin(Star):
         # 优先尝试增强参数；若后端不支持 preset，再自动降级到基础参数
         video_config_candidates: List[Dict[str, Any]] = [
             {
-                "size": target_size,
+                "aspect_ratio": self._size_to_aspect_ratio(target_size),
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
                 "preset": "custom",
             },
             {
-                "size": target_size,
+                "aspect_ratio": self._size_to_aspect_ratio(target_size),
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
             },
@@ -2269,7 +2308,8 @@ class GrokPlugin(Star):
         if not target_size:
             target_size = self.DEFAULT_TEXT_IMAGE_SIZE
 
-        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {target_size} ...")
+        aspect_ratio_display = self._get_aspect_ratio_display(target_size)
+        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {aspect_ratio_display} ...")
 
         results, error = await self._generate_image(
             prompt_text,
@@ -2370,8 +2410,9 @@ class GrokPlugin(Star):
 
         video_target_size = target_size or self.DEFAULT_VIDEO_SIZE
 
+        aspect_ratio_display = self._get_aspect_ratio_display(video_target_size)
         yield event.plain_result(
-            f"🎬 正在进行 [{mode}] · {video_length_seconds}秒 · {target_size} ..."
+            f"🎬 正在进行 [{mode}] · {video_length_seconds}秒 · {aspect_ratio_display} ..."
         )
 
         video_result, error = await self._generate_video(
