@@ -545,7 +545,8 @@ class GrokPlugin(Star):
             )
             ratio_distance = abs((cand_w / cand_h) - target_ratio)
             area_distance = abs((cand_w * cand_h) - target_area) / max(target_area, 1)
-            return dim_distance, ratio_distance, area_distance
+            # 比例优先：先保证构图比例，再考虑像素接近度
+            return ratio_distance, area_distance, dim_distance
 
         best = min(candidates, key=distance)
         return best[0]
@@ -560,13 +561,19 @@ class GrokPlugin(Star):
         Returns:
             宽高比字符串，如 "16:9"
         """
+        # 白名单：Grok 支持的标准比例
+        ALLOWED_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
+
         if size in cls.SIZE_TO_ASPECT_RATIO:
             return cls.SIZE_TO_ASPECT_RATIO[size]
         if ":" in size:
             parts = size.split(":")
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                return size
-        return "16:9"
+                # 只接受白名单中的比例
+                if size in ALLOWED_RATIOS:
+                    return size
+        # 回退值与 grok2api 保持一致
+        return "2:3"
 
     @classmethod
     def _get_aspect_ratio_display(cls, size: str) -> str:
