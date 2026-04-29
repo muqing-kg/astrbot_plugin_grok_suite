@@ -720,6 +720,7 @@ class GrokPlugin(Star):
         self,
         prompt: str,
         image_bytes: Optional[bytes] = None,
+        extra_image_bytes: Optional[List[bytes]] = None,
         mask_bytes: Optional[bytes] = None,
         n: int = 1,
         target_size: Optional[str] = None,
@@ -735,6 +736,7 @@ class GrokPlugin(Star):
                 image_bytes,
                 n,
                 target_size=target_size,
+                extra_image_bytes=extra_image_bytes,
                 mask_bytes=mask_bytes,
             )
 
@@ -832,6 +834,7 @@ class GrokPlugin(Star):
         prompt: str,
         n: int,
         image_bytes: bytes,
+        extra_image_bytes: Optional[List[bytes]] = None,
         size: Optional[str] = None,
         response_format: Optional[str] = "url",
         mask_bytes: Optional[bytes] = None,
@@ -846,16 +849,19 @@ class GrokPlugin(Star):
         if size:
             form.add_field("size", size)
 
-        mime_type = self._detect_mime_type(image_bytes)
-        ext = mime_type.split("/")[-1]
-        if ext == "jpeg":
-            ext = "jpg"
-        form.add_field(
-            "image",
-            image_bytes,
-            filename=f"image.{ext}",
-            content_type=mime_type,
-        )
+        all_images = [img for img in [image_bytes, *(extra_image_bytes or [])] if img]
+        image_field_name = "image[]" if len(all_images) > 1 else "image"
+        for index, img in enumerate(all_images, start=1):
+            mime_type = self._detect_mime_type(img)
+            ext = mime_type.split("/")[-1]
+            if ext == "jpeg":
+                ext = "jpg"
+            form.add_field(
+                image_field_name,
+                img,
+                filename=f"image_{index}.{ext}",
+                content_type=mime_type,
+            )
         if mask_bytes:
             mask_mime_type = self._detect_mime_type(mask_bytes)
             mask_ext = mask_mime_type.split("/")[-1]
@@ -875,6 +881,7 @@ class GrokPlugin(Star):
         image_bytes: bytes,
         n: int = 1,
         target_size: Optional[str] = None,
+        extra_image_bytes: Optional[List[bytes]] = None,
         mask_bytes: Optional[bytes] = None,
     ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 图片编辑 API (图生图)
@@ -912,6 +919,7 @@ class GrokPlugin(Star):
                         prompt=prompt,
                         n=n,
                         image_bytes=image_bytes,
+                        extra_image_bytes=extra_image_bytes,
                         size=current_size,
                         response_format=response_format,
                         mask_bytes=mask_bytes,
@@ -2304,9 +2312,10 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 当前会话无权限使用此功能")
             return
 
-        image_inputs = await self._get_images_from_event(event, max_count=2)
+        image_inputs = await self._get_images_from_event(event, max_count=4)
         image_bytes = image_inputs[0] if image_inputs else None
-        mask_bytes = image_inputs[1] if len(image_inputs) > 1 else None
+        extra_image_bytes = image_inputs[1:] if len(image_inputs) > 1 else []
+        mask_bytes = None
         mode = "图生图" if image_bytes else "文生图"
 
         prompt_text, params = self._parse_image_params(user_input, strict_size=not image_bytes)
@@ -2342,11 +2351,13 @@ class GrokPlugin(Star):
             target_size = self.DEFAULT_TEXT_IMAGE_SIZE
 
         aspect_ratio_display = self._get_aspect_ratio_display(target_size)
-        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {aspect_ratio_display} ...")
+        image_count_hint = f" · 输入{len(image_inputs)}图" if len(image_inputs) > 1 else ""
+        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {aspect_ratio_display}{image_count_hint} ...")
 
         results, error = await self._generate_image(
             prompt_text,
             image_bytes,
+            extra_image_bytes=extra_image_bytes,
             mask_bytes=mask_bytes,
             n=n,
             target_size=target_size,
